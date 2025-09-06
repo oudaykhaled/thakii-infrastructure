@@ -1,0 +1,198 @@
+name: Deploy Thakii Backend to thakii-02 (Direct SSH)
+
+on:
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: 'Docker registry URL'
+        required: true
+        default: 'ghcr.io'
+      service_name:
+        description: 'Service name for deployment'
+        required: true
+        default: 'thakii-lecture2pdf-backend'
+      internal_port:
+        description: 'Internal port of the service'
+        required: true
+        default: '5001'
+      external_port:
+        description: 'External port of the service'
+        required: true
+        default: '5001'
+      worker_service_name:
+        description: 'Worker service name'
+        required: true
+        default: 'thakii-lecture2pdf-worker'
+      server:
+        description: 'Server address for SSH'
+        required: true
+        default: 'thakii-02.fanusdigital.site'
+      ssh_user:
+        description: 'SSH username'
+        required: true
+        default: 'ec2-user'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup SSH Connection (Direct)
+        run: |
+          echo "🔑 Setting up SSH key and configuration..."
+          # Create SSH directory
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          
+          # Decode and save SSH private key
+          echo "${{ secrets.THAKII_02_SSH_PRIVATE_KEY }}" | tr -d '\n\r' | base64 -d > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          
+          # Create SSH config for direct connection
+          cat >> ~/.ssh/config << EOF
+          Host ${{ inputs.server }}
+            HostName ${{ inputs.server }}
+            User ${{ inputs.ssh_user }}
+            IdentityFile ~/.ssh/id_rsa
+            ConnectTimeout 30
+            ServerAliveInterval 60
+            ServerAliveCountMax 3
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+          EOF
+          chmod 600 ~/.ssh/config
+          echo "✅ SSH configuration created"
+
+    - name: Test SSH Connection
+      run: |
+        echo "🧪 Testing SSH connection to ${{ inputs.server }}..."
+        
+        # First, let's check what IP the hostname resolves to
+        echo "🔍 DNS Resolution:"
+        nslookup ${{ inputs.server }} || true
+        dig ${{ inputs.server }} A +short || true
+        
+        # Test connection with timeout
+        echo "🔌 Testing SSH connection..."
+        if timeout 30 ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no ${{ inputs.server }} "echo 'SSH connection successful!'" 2>/dev/null; then
+          echo "✅ SSH connection established successfully"
+        else
+          echo "❌ SSH connection failed to ${{ inputs.server }}"
+          echo "🔍 Debugging information:"
+          echo "Server: ${{ inputs.server }}"
+          echo "User: ${{ inputs.ssh_user }}"
+          
+          # Try to get more information about the connection failure
+          echo "📡 Connection attempt details:"
+          timeout 10 ssh -v -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${{ inputs.server }} "echo 'Debug connection'" 2>&1 | head -20 || true
+          
+          # Check if this might be a network accessibility issue
+          echo "🌐 Network connectivity test:"
+          ping -c 3 ${{ inputs.server }} || true
+          
+          echo "⚠️  This might be a network accessibility issue."
+          echo "   The server may be behind NAT/firewall or only accessible from certain networks."
+          echo "   Consider using the local deployment script: ./deploy-local.sh"
+          
+          exit 1
+        fi
+
+      - name: Set up Docker Environment
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ inputs.registry }} -u ${{ github.actor }} --password-stdin
+
+      - name: Build and Push Docker Images
+        run: |
+          # Build main backend image
+          BACKEND_IMAGE="${{ inputs.registry }}/${{ github.repository_owner }}/${{ inputs.service_name }}:${{ github.run_id }}"
+          docker build -f backend/deploy/Dockerfile -t $BACKEND_IMAGE ./backend
+          docker push $BACKEND_IMAGE
+          
+          echo "BACKEND_IMAGE=$BACKEND_IMAGE" >> $GITHUB_ENV
+
+      - name: Deploy Services to Server
+        run: |
+          # Deploy backend and worker services
+          ssh ${{ inputs.server }} "
+            # Login to registry
+            echo '${{ secrets.GITHUB_TOKEN }}' | docker login ${{ inputs.registry }} -u '${{ github.actor }}' --password-stdin
+            
+            # Pull the new image
+            docker pull '${{ env.BACKEND_IMAGE }}'
+            
+            # Stop and remove existing services
+            docker service rm ${{ inputs.service_name }} || echo 'Backend service not found. Continuing...'
+            docker service rm ${{ inputs.worker_service_name }} || echo 'Worker service not found. Continuing...'
+            
+            # Wait a moment for cleanup
+            sleep 5
+            
+            # Create backend service
+            docker service create \\
+              --name ${{ inputs.service_name }} \\
+              --publish published=${{ inputs.external_port }},mode=host,target=${{ inputs.internal_port }} \\
+              --replicas 1 \\
+              --env S3_BUCKET_NAME=thakii-video-storage-1753883631 \\
+              --env AWS_DEFAULT_REGION=us-east-2 \\
+              --env FLASK_ENV=production \\
+              --env PYTHONPATH=/app \\
+              --mount type=bind,source=/home/ec2-user/firebase-service-account.json,target=/app/firebase-service-account.json,readonly \\
+              --restart-condition on-failure \\
+              --restart-max-attempts 3 \\
+              '${{ env.BACKEND_IMAGE }}' \\
+              python api/app.py
+            
+            # Create worker service
+            docker service create \\
+              --name ${{ inputs.worker_service_name }} \\
+              --replicas 1 \\
+              --env S3_BUCKET_NAME=thakii-video-storage-1753883631 \\
+              --env AWS_DEFAULT_REGION=us-east-2 \\
+              --env PYTHONPATH=/app \\
+              --mount type=bind,source=/home/ec2-user/firebase-service-account.json,target=/app/firebase-service-account.json,readonly \\
+              --restart-condition on-failure \\
+              --restart-max-attempts 3 \\
+              '${{ env.BACKEND_IMAGE }}' \\
+              python worker/worker.py
+            
+            echo '✅ Services deployed successfully'
+          "
+
+      - name: Verify Deployment
+        run: |
+          echo "🔍 Verifying deployment..."
+          sleep 30  # Wait for services to start
+          
+          ssh ${{ inputs.server }} "
+            echo '📊 Service Status:'
+            docker service ls | grep thakii-lecture2pdf || echo 'No services found'
+            
+            echo '🔍 Service Logs (Backend):'
+            docker service logs --tail 10 ${{ inputs.service_name }} || echo 'No backend logs available'
+            
+            echo '🔍 Service Logs (Worker):'
+            docker service logs --tail 10 ${{ inputs.worker_service_name }} || echo 'No worker logs available'
+            
+            echo '🌐 Testing health endpoint...'
+            if curl -f http://localhost:${{ inputs.external_port }}/health 2>/dev/null; then
+              echo '✅ Backend health check passed'
+            else
+              echo '❌ Backend health check failed'
+            fi
+          "
+
+      - name: Deployment Summary
+        run: |
+          echo "🎉 Deployment completed!"
+          echo "📍 Server: ${{ inputs.server }}"
+          echo "🐳 Backend Service: ${{ inputs.service_name }}"
+          echo "⚙️ Worker Service: ${{ inputs.worker_service_name }}"
+          echo "🌐 Backend URL: http://${{ inputs.server }}:${{ inputs.external_port }}"
+          echo "❤️ Health Check: http://${{ inputs.server }}:${{ inputs.external_port }}/health"

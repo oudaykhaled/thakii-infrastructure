@@ -1,0 +1,224 @@
+name: Deploy Thakii Backend (Native - No Docker)
+
+on:
+  workflow_dispatch:
+    inputs:
+      server:
+        description: 'Server address for SSH'
+        required: true
+        default: 'thakii-02.fds-1.com'
+      ssh_user:
+        description: 'SSH username'
+        required: true
+        default: 'ec2-user'
+      backend_port:
+        description: 'Backend service port'
+        required: true
+        default: '5001'
+      worker_enabled:
+        description: 'Enable worker service'
+        required: true
+        default: 'true'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup SSH Connection via Cloudflare
+        uses: ./.github/actions/cloudflare-ssh
+        with:
+          ssh-private-key: ${{ secrets.THAKII_02_SSH_PRIVATE_KEY }}
+          server-hostname: ${{ inputs.server }}
+          server-user: ${{ inputs.ssh_user }}
+          host-alias: 'thakii-02'
+
+      - name: Deploy Backend Services
+        run: |
+          echo "🚀 Deploying Thakii Backend Services (Native Python)"
+          echo "=================================================="
+          
+          # Deploy to server
+          ssh thakii-02 << 'EOF'
+            set -e
+            
+            echo "📁 Setting up deployment directory..."
+            DEPLOY_DIR="/home/ec2-user/thakii-backend"
+            mkdir -p $DEPLOY_DIR
+            cd $DEPLOY_DIR
+            
+            echo "🛑 Stopping existing services..."
+            # Kill existing processes
+            pkill -f "python.*api/app.py" || echo "No backend process found"
+            pkill -f "python.*worker/worker.py" || echo "No worker process found"
+            
+            echo "📥 Downloading latest code..."
+            # Clean and get fresh code
+            rm -rf thakii-backend-new
+            git clone https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git thakii-backend-new
+            cd thakii-backend-new
+            git checkout ${{ github.sha }}
+            
+            echo "🐍 Setting up Python environment..."
+            # Debug: Show current directory structure
+            echo "📍 Current directory: $(pwd)"
+            echo "📂 Directory contents:"
+            ls -la
+            echo "📂 Parent directory contents:"
+            ls -la ..
+            
+            # Install required packages for Python virtual environment
+            sudo apt update
+            sudo apt install -y python3-venv python3-pip python3-dev
+            
+            # Create virtual environment if it doesn't exist or recreate if incomplete
+            if [ ! -d "../venv" ] || [ ! -f "../venv/bin/pip" ]; then
+                echo "🔄 Creating/recreating virtual environment..."
+                rm -rf ../venv
+                python3 -m venv ../venv --system-site-packages
+                # Ensure pip is installed in venv
+                ../venv/bin/python -m ensurepip --upgrade || python3 -m ensurepip --upgrade
+            fi
+            
+            # Activate virtual environment
+            echo "🔍 Checking venv structure:"
+            ls -la ../venv/bin/ || echo "bin directory not found"
+            
+            if [ -f "../venv/bin/activate" ]; then
+                source ../venv/bin/activate
+                echo "✅ Virtual environment activated via activate script"
+            elif [ -f "../venv/bin/python" ]; then
+                # Alternative: use the venv python directly
+                export PATH="../venv/bin:$PATH"
+                export VIRTUAL_ENV="../venv"
+                echo "✅ Virtual environment activated via PATH"
+            else
+                echo "❌ Virtual environment activation failed"
+                echo "📂 venv structure:"
+                find ../venv -type f -name "*activate*" -o -name "python*" | head -10
+                exit 1
+            fi
+            
+            echo "📦 Installing dependencies..."
+            # Use venv python directly for installations
+            ../venv/bin/python -m pip install --upgrade pip
+            ../venv/bin/python -m pip install -r backend/requirements.txt
+            
+            # Install lecture2pdf dependencies
+            if [ -f "backend/lecture2pdf-external/requirements.txt" ]; then
+                ../venv/bin/python -m pip install -r backend/lecture2pdf-external/requirements.txt
+            fi
+            ../venv/bin/python -m pip install moviepy
+            
+            echo "🔧 Setting up environment..."
+            # Create necessary directories both in current and parent
+            mkdir -p logs videos generated_pdfs instance
+            mkdir -p ../logs ../videos ../generated_pdfs ../instance
+            
+            # Set environment variables
+            export PYTHONPATH="/home/ec2-user/thakii-backend/thakii-backend-new:/home/ec2-user/thakii-backend/thakii-backend-new/backend"
+            export LECTURE2PDF_PATH="/home/ec2-user/thakii-backend/thakii-backend-new/backend/lecture2pdf-external"
+            export FLASK_APP="backend/api/app.py"
+            export FLASK_ENV="production"
+            export FLASK_RUN_HOST="0.0.0.0"
+            export FLASK_RUN_PORT="${{ inputs.backend_port }}"
+            export S3_BUCKET_NAME="thakii-video-storage-1753883631"
+            export AWS_DEFAULT_REGION="us-east-2"
+            export DISABLE_FIREBASE="true"
+            
+            echo "🚀 Starting backend service..."
+            # Test if the backend script can run
+            echo "🧪 Testing backend script..."
+            ../venv/bin/python -c "import backend.api.app; print('✅ Backend imports successfully')" || echo "❌ Backend import failed"
+            
+            # Start backend service in background
+            echo "📝 Starting backend with logging..."
+            nohup ../venv/bin/python backend/api/app.py > ../logs/backend.log 2>&1 &
+            BACKEND_PID=$!
+            echo $BACKEND_PID > ../backend.pid
+            echo "Backend started with PID: $BACKEND_PID"
+            
+            # Wait and check if process is still running
+            sleep 3
+            if kill -0 $BACKEND_PID 2>/dev/null; then
+                echo "✅ Backend process is running"
+            else
+                echo "❌ Backend process exited - checking logs..."
+                tail -20 ../logs/backend.log || echo "No backend logs available"
+            fi
+            
+            sleep 2
+            
+            if [ "${{ inputs.worker_enabled }}" = "true" ]; then
+                echo "🔄 Starting worker service..."
+                # Start worker service in background
+                nohup ../venv/bin/python backend/worker/worker.py > ../logs/worker.log 2>&1 &
+                WORKER_PID=$!
+                echo $WORKER_PID > ../worker.pid
+                echo "Worker started with PID: $WORKER_PID"
+            fi
+            
+            echo "✅ Services started successfully!"
+            
+            # Show process status
+            echo "📊 Process Status:"
+            ps aux | grep -E "(python.*api|python.*worker)" | grep -v grep || echo "No processes found"
+            
+            echo "🏥 Health check..."
+            sleep 10
+            if curl -f http://localhost:${{ inputs.backend_port }}/health 2>/dev/null; then
+                echo "✅ Backend health check passed"
+            else
+                echo "⚠️  Backend health check failed - checking logs..."
+                tail -20 ../logs/backend.log || echo "No backend logs found"
+            fi
+            
+            # Replace old deployment with new one
+            cd ..
+            if [ -d "thakii-backend-old" ]; then
+                rm -rf thakii-backend-old
+            fi
+            if [ -d "thakii-backend-current" ]; then
+                mv thakii-backend-current thakii-backend-old
+            fi
+            mv thakii-backend-new thakii-backend-current
+            
+            echo "🎉 Deployment completed successfully!"
+            echo "📍 Backend available at: http://$(hostname -I | awk '{print $1}'):${{ inputs.backend_port }}"
+          EOF
+
+      - name: Verify Deployment
+        run: |
+          echo "🔍 Verifying deployment..."
+          
+          ssh thakii-02 << 'EOF'
+            echo "📊 Service Status:"
+            ps aux | grep -E "(python.*api|python.*worker)" | grep -v grep || echo "No Python services running"
+            
+            echo ""
+            echo "📁 Deployment Structure:"
+            ls -la /home/ec2-user/thakii-backend/ || echo "Deployment directory not found"
+            
+            echo ""
+            echo "📝 Recent Logs:"
+            echo "--- Backend Log (last 10 lines) ---"
+            tail -10 /home/ec2-user/thakii-backend/logs/backend.log 2>/dev/null || echo "No backend logs"
+            
+            if [ -f "/home/ec2-user/thakii-backend/logs/worker.log" ]; then
+                echo "--- Worker Log (last 10 lines) ---"
+                tail -10 /home/ec2-user/thakii-backend/logs/worker.log 2>/dev/null || echo "No worker logs"
+            fi
+            
+            echo ""
+            echo "🌐 Network Test:"
+            curl -s http://localhost:${{ inputs.backend_port }}/health || echo "Health endpoint not responding"
+          EOF
+          
+          echo "✅ Deployment verification completed!"

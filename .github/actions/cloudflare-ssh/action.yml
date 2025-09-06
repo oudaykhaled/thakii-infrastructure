@@ -1,0 +1,75 @@
+name: 'Cloudflare SSH Connection'
+description: 'Establishes SSH connection through Cloudflare tunnel'
+inputs:
+  ssh-private-key:
+    description: 'Base64 encoded SSH private key'
+    required: true
+  server-hostname:
+    description: 'Cloudflare tunnel hostname'
+    required: true
+  server-user:
+    description: 'SSH username'
+    required: true
+    default: 'ec2-user'
+  connect-timeout:
+    description: 'Connection timeout in seconds'
+    required: false
+    default: '30'
+  host-alias:
+    description: 'SSH host alias for subsequent connections'
+    required: false
+    default: 'target-server'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install cloudflared
+      shell: bash
+      run: |
+        echo "📥 Installing cloudflared..."
+        # Download and install cloudflared
+        wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+        sudo dpkg -i cloudflared-linux-amd64.deb || sudo apt-get install -f -y
+        # Verify installation
+        cloudflared version
+        echo "✅ cloudflared installed: $(cloudflared version)"
+
+    - name: Setup SSH key and configuration
+      shell: bash
+      run: |
+        echo "🔑 Setting up SSH key and configuration..."
+        # Create SSH directory
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+        
+        # Decode and save SSH private key (robust handling)
+        echo "${{ inputs.ssh-private-key }}" | tr -d '\n\r' | base64 -d > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        
+        # Create SSH config for Cloudflare tunnel
+        cat >> ~/.ssh/config << EOF
+        Host ${{ inputs.host-alias }}
+          HostName ${{ inputs.server-hostname }}
+          User ${{ inputs.server-user }}
+          IdentityFile ~/.ssh/id_rsa
+          ProxyCommand cloudflared access ssh --hostname ${{ inputs.server-hostname }}
+          ConnectTimeout ${{ inputs.connect-timeout }}
+          ServerAliveInterval 60
+          ServerAliveCountMax 3
+          StrictHostKeyChecking no
+          UserKnownHostsFile /dev/null
+        EOF
+        chmod 600 ~/.ssh/config
+        echo "✅ SSH configuration created for host: ${{ inputs.host-alias }}"
+
+    - name: Test SSH connection
+      shell: bash
+      run: |
+        echo "🧪 Testing SSH connection to ${{ inputs.server-hostname }}..."
+        # Test connection with timeout
+        if timeout ${{ inputs.connect-timeout }} ssh ${{ inputs.host-alias }} "echo 'SSH connection successful!'" 2>/dev/null; then
+          echo "✅ SSH connection established successfully"
+        else
+          echo "❌ SSH connection failed"
+          exit 1
+        fi

@@ -1,0 +1,144 @@
+name: Deploy Thakii Backend to thakii-02
+
+on:
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: 'Docker registry URL'
+        required: true
+        default: 'ghcr.io'
+      service_name:
+        description: 'Service name for deployment'
+        required: true
+        default: 'thakii-lecture2pdf-backend'
+      internal_port:
+        description: 'Internal port of the service'
+        required: true
+        default: '5001'
+      external_port:
+        description: 'External port of the service'
+        required: true
+        default: '5001'
+      worker_service_name:
+        description: 'Worker service name'
+        required: true
+        default: 'thakii-lecture2pdf-worker'
+      server:
+        description: 'Server address for SSH'
+        required: true
+        default: 'thakii-02.fds-1.com'
+      ssh_user:
+        description: 'SSH username'
+        required: true
+        default: 'ec2-user'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup SSH Connection via Cloudflare
+        uses: ./.github/actions/cloudflare-ssh
+        with:
+          ssh-private-key: ${{ secrets.THAKII_02_SSH_PRIVATE_KEY }}
+          server-hostname: ${{ inputs.server }}
+          server-user: ${{ inputs.ssh_user }}
+          host-alias: 'thakii-02'
+
+      - name: Set up Docker Environment
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ inputs.registry }} -u ${{ github.actor }} --password-stdin
+
+      - name: Build and Push Docker Images
+        run: |
+          # Build main backend image
+          BACKEND_IMAGE="${{ inputs.registry }}/${{ github.repository_owner }}/${{ inputs.service_name }}:${{ github.run_id }}"
+          docker build -f backend/deploy/Dockerfile -t $BACKEND_IMAGE ./backend
+          docker push $BACKEND_IMAGE
+          
+          echo "BACKEND_IMAGE=$BACKEND_IMAGE" >> $GITHUB_ENV
+
+      - name: Deploy Services to Server
+        run: |
+          # Deploy backend and worker services
+          ssh thakii-02 "
+            # Login to registry
+            echo '${{ secrets.GITHUB_TOKEN }}' | docker login ${{ inputs.registry }} -u '${{ github.actor }}' --password-stdin
+            
+            # Pull the new image
+            docker pull '${{ env.BACKEND_IMAGE }}'
+            
+            # Stop and remove existing services
+            docker service rm ${{ inputs.service_name }} || echo 'Backend service not found. Continuing...'
+            docker service rm ${{ inputs.worker_service_name }} || echo 'Worker service not found. Continuing...'
+            
+            # Wait a moment for cleanup
+            sleep 5
+            
+            # Create backend service
+            docker service create \\
+              --name ${{ inputs.service_name }} \\
+              --publish published=${{ inputs.external_port }},mode=host,target=${{ inputs.internal_port }} \\
+              --replicas 1 \\
+              --env S3_BUCKET_NAME=thakii-video-storage-1753883631 \\
+              --env AWS_DEFAULT_REGION=us-east-2 \\
+              --env FLASK_ENV=production \\
+              --env PYTHONPATH=/app \\
+              --restart-condition on-failure \\
+              --restart-max-attempts 3 \\
+              '${{ env.BACKEND_IMAGE }}' \\
+              python api/app.py
+            
+            # Create worker service
+            docker service create \\
+              --name ${{ inputs.worker_service_name }} \\
+              --replicas 1 \\
+              --env S3_BUCKET_NAME=thakii-video-storage-1753883631 \\
+              --env AWS_DEFAULT_REGION=us-east-2 \\
+              --env PYTHONPATH=/app \\
+              --restart-condition on-failure \\
+              --restart-max-attempts 3 \\
+              '${{ env.BACKEND_IMAGE }}' \\
+              python worker/worker.py
+            
+            echo '✅ Services deployed successfully'
+          "
+
+      - name: Verify Deployment
+        run: |
+          echo "🔍 Verifying deployment..."
+          sleep 30  # Wait for services to start
+          
+          ssh thakii-02 "
+            echo '📊 Service Status:'
+            docker service ls | grep thakii-lecture2pdf || echo 'No services found'
+            
+            echo '🔍 Service Logs (Backend):'
+            docker service logs --tail 10 ${{ inputs.service_name }} || echo 'No backend logs available'
+            
+            echo '🔍 Service Logs (Worker):'
+            docker service logs --tail 10 ${{ inputs.worker_service_name }} || echo 'No worker logs available'
+            
+            echo '🌐 Testing health endpoint...'
+            if curl -f http://localhost:${{ inputs.external_port }}/health 2>/dev/null; then
+              echo '✅ Backend health check passed'
+            else
+              echo '❌ Backend health check failed'
+            fi
+          "
+
+      - name: Deployment Summary
+        run: |
+          echo "🎉 Deployment completed!"
+          echo "📍 Server: ${{ inputs.server }}"
+          echo "🐳 Backend Service: ${{ inputs.service_name }}"
+          echo "⚙️ Worker Service: ${{ inputs.worker_service_name }}"
+          echo "🌐 Backend URL: http://${{ inputs.server }}:${{ inputs.external_port }}"
+          echo "❤️ Health Check: http://${{ inputs.server }}:${{ inputs.external_port }}/health"
